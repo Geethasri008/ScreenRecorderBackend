@@ -18,7 +18,8 @@ const allowedOrigins = [
   "http://localhost:5173",
   "https://screen-recorder-frontend-six.vercel.app",
   "https://screen-recorder-frontend-ixl2xytsi-geethas-projects-594b30ca.vercel.app",
-  "https://screen-recorder-frontend-n3stbe1wr-geethas-projects-594b30ca.vercel.app"
+  "https://screen-recorder-frontend-n3stbe1wr-geethas-projects-594b30ca.vercel.app",
+  "https://screen-recorder-frontend-dq61jvakv-geethas-projects-594b30ca.vercel.app"
 ];
 
 // Middlewares
