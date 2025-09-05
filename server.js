@@ -13,13 +13,23 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const PORT = process.env.PORT || 5000;
 
+// Allowed origins
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://screen-recorder-frontend-six.vercel.app",
+  "https://screen-recorder-frontend-ixl2xytsi-geethas-projects-594b30ca.vercel.app",
+];
+
 // Middlewares
 app.use(
   cors({
-    origin: [
-      "http://localhost:5173",
-      "https://screen-recorder-frontend-six.vercel.app",
-    ],
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+      } else {
+        callback(new Error("CORS not allowed"));
+      }
+    },
     methods: ["GET", "POST"],
   })
 );
