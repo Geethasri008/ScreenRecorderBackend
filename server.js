@@ -2,10 +2,10 @@ import express from 'express';
 import cors from 'cors';
 import morgan from 'morgan';
 import multer from 'multer';
-import fs from 'fs';
-import path from 'path';
-import sqlite3 from 'sqlite3';
+import pkg from 'pg';
+import { v2 as cloudinary } from 'cloudinary';
 import { fileURLToPath } from 'url';
+import path from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,36 +14,39 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middlewares
-app.use(cors({ origin: 'http://localhost:5173' })); // Vite default
+app.use(cors({ origin: 'https://screen-recorder-frontend-six.vercel.app/' })); // Update with frontend URL after deploy
 app.use(morgan('dev'));
 app.use(express.json());
 
-// Ensure uploads dir exists
-const uploadsDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir);
-
-// SQLite setup
-const dbPath = path.join(__dirname, 'database.db');
-const db = new sqlite3.Database(dbPath);
-
-db.serialize(() => {
-  db.run(`CREATE TABLE IF NOT EXISTS recordings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    filename TEXT NOT NULL,
-    filepath TEXT NOT NULL,
-    filesize INTEGER NOT NULL,
-    createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  )`);
+// Cloudinary config (use env vars in Render)
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
 });
 
-// Multer storage
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadsDir),
-  filename: (req, file, cb) => {
-    const safe = `${Date.now()}-${file.originalname.replace(/\s+/g, '_')}`;
-    cb(null, safe);
-  }
+const { Pool } = pkg;
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
+
+// Ensure table exists
+(async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS recordings (
+      id SERIAL PRIMARY KEY,
+      filename TEXT NOT NULL,
+      url TEXT NOT NULL,
+      filesize BIGINT NOT NULL,
+      createdAt TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+})();
+
+// Multer — keep files in memory (not disk)
+const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
 // Routes
@@ -51,19 +54,35 @@ app.get('/', (req, res) => {
   res.json({ status: 'OK', message: 'Screen Recorder API running' });
 });
 
-// POST /api/recordings — upload video
-app.post('/api/recordings', upload.single('video'), (req, res) => {
+// POST /api/recordings — upload video to Cloudinary
+app.post('/api/recordings', upload.single('video'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-    const { filename, path: filepath, size } = req.file;
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
-    const insert = db.prepare('INSERT INTO recordings (filename, filepath, filesize) VALUES (?, ?, ?)');
-    insert.run(filename, filepath, size, function (err) {
-      if (err) return res.status(500).json({ error: 'DB insert failed' });
-      const record = { id: this.lastID, filename, filepath, filesize: size };
-      res.status(201).json({ message: 'Recording uploaded successfully', recording: record });
+    const { originalname, buffer, size } = req.file;
+
+    // Upload to Cloudinary
+    const uploadResult = await new Promise((resolve, reject) => {
+      cloudinary.uploader
+        .upload_stream(
+          { resource_type: 'video', folder: 'recordings' },
+          (error, result) => {
+            if (error) reject(error);
+            else resolve(result);
+          }
+        )
+        .end(buffer);
+    });
+
+    // Save metadata in Postgres
+    const result = await pool.query(
+      `INSERT INTO recordings (filename, url, filesize) VALUES ($1, $2, $3) RETURNING *`,
+      [originalname, uploadResult.secure_url, size]
+    );
+
+    res.status(201).json({
+      message: 'Recording uploaded successfully',
+      recording: result.rows[0]
     });
   } catch (e) {
     console.error(e);
@@ -72,46 +91,36 @@ app.post('/api/recordings', upload.single('video'), (req, res) => {
 });
 
 // GET /api/recordings — list metadata
-app.get('/api/recordings', (req, res) => {
-  db.all('SELECT id, filename, filesize, createdAt FROM recordings ORDER BY id DESC', [], (err, rows) => {
-    if (err) return res.status(500).json({ error: 'DB query failed' });
-    res.json(rows);
-  });
+app.get('/api/recordings', async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, filename, url, filesize, createdAt FROM recordings ORDER BY id DESC`
+    );
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'DB query failed' });
+  }
 });
 
-// GET /api/recordings/:id — stream video with range support
-app.get('/api/recordings/:id', (req, res) => {
-  const id = parseInt(req.params.id, 10);
-  db.get('SELECT * FROM recordings WHERE id = ?', [id], (err, row) => {
-    if (err) return res.status(500).json({ error: 'DB query failed' });
+// GET /api/recordings/:id — return Cloudinary video URL
+app.get('/api/recordings/:id', async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM recordings WHERE id = $1`,
+      [req.params.id]
+    );
+    const row = rows[0];
     if (!row) return res.status(404).json({ error: 'Recording not found' });
 
-    const videoPath = row.filepath;
-    const stat = fs.statSync(videoPath);
-    const fileSize = stat.size;
-    const range = req.headers.range;
-
-    if (range) {
-      const parts = range.replace(/bytes=/, '').split('-');
-      const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
-      const chunkSize = (end - start) + 1;
-      const file = fs.createReadStream(videoPath, { start, end });
-      res.writeHead(206, {
-        'Content-Range': `bytes ${start}-${end}/${fileSize}`,
-        'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
-        'Content-Type': 'video/webm'
-      });
-      file.pipe(res);
-    } else {
-      res.writeHead(200, {
-        'Content-Length': fileSize,
-        'Content-Type': 'video/webm'
-      });
-      fs.createReadStream(videoPath).pipe(res);
-    }
-  });
+    // Instead of streaming, just return Cloudinary URL
+    res.json({ url: row.url });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'DB query failed' });
+  }
 });
 
-app.listen(PORT, () => console.log(`API listening on http://localhost:${PORT}`));
+app.listen(PORT, () =>
+  console.log(`API listening on http://localhost:${PORT}`)
+);
