@@ -1,11 +1,11 @@
-import express from 'express';
-import cors from 'cors';
-import morgan from 'morgan';
-import multer from 'multer';
-import pkg from 'pg';
-import { v2 as cloudinary } from 'cloudinary';
-import { fileURLToPath } from 'url';
-import path from 'path';
+import express from "express";
+import cors from "cors";
+import morgan from "morgan";
+import multer from "multer";
+import pkg from "pg";
+import { v2 as cloudinary } from "cloudinary";
+import { fileURLToPath } from "url";
+import path from "path";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -14,15 +14,16 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Middlewares
-const cors = require("cors");
-app.use(cors({
-  origin: [
-    "http://localhost:5173", 
-    "https://screen-recorder-frontend-six.vercel.app"
-  ],
-  methods: ["GET", "POST"],
-}));
-app.use(morgan('dev'));
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "https://screen-recorder-frontend-six.vercel.app",
+    ],
+    methods: ["GET", "POST"],
+  })
+);
+app.use(morgan("dev"));
 app.use(express.json());
 
 // PostgreSQL
@@ -32,7 +33,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-// Create table if not exists
+// Ensure table exists
 (async () => {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS recordings (
@@ -45,68 +46,69 @@ const pool = new Pool({
   `);
 })();
 
-// Cloudinary setup
+// Cloudinary config
 cloudinary.config({
   cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
   api_key: process.env.CLOUDINARY_API_KEY,
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Multer (store in memory before upload to Cloudinary)
+// Multer (in memory)
 const storage = multer.memoryStorage();
 const upload = multer({ storage });
 
-// Root
-app.get('/', (req, res) => {
-  res.json({ status: 'OK', message: 'Screen Recorder API running' });
+// Root route
+app.get("/", (req, res) => {
+  res.json({ status: "OK", message: "Screen Recorder API running" });
 });
 
 // Upload route
-app.post('/upload', upload.single('file'), async (req, res) => {
+app.post("/upload", upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+      return res.status(400).json({ error: "No file uploaded" });
     }
 
-    // Upload to Cloudinary
-    const result = await cloudinary.uploader.upload_stream(
-      { resource_type: 'video', folder: 'recordings' },
-      async (error, uploadResult) => {
-        if (error) {
-          console.error('Cloudinary error:', error);
-          return res.status(500).json({ error: 'Upload to Cloudinary failed' });
-        }
-
-        // Save metadata to DB
-        const { originalname, size } = req.file;
-        const filename = `${Date.now()}-${originalname}`;
-        await pool.query(
-          'INSERT INTO recordings (filename, url, filesize) VALUES ($1, $2, $3)',
-          [filename, uploadResult.secure_url, size]
+    // Wrap Cloudinary upload_stream in a Promise
+    const uploadToCloudinary = () =>
+      new Promise((resolve, reject) => {
+        const stream = cloudinary.uploader.upload_stream(
+          { resource_type: "video", folder: "recordings" },
+          (error, result) => {
+            if (error) return reject(error);
+            resolve(result);
+          }
         );
+        stream.end(req.file.buffer);
+      });
 
-        res.json({ url: uploadResult.secure_url, filename });
-      }
+    const uploadResult = await uploadToCloudinary();
+
+    // Save to DB
+    const { originalname, size } = req.file;
+    const filename = `${Date.now()}-${originalname}`;
+    await pool.query(
+      "INSERT INTO recordings (filename, url, filesize) VALUES ($1, $2, $3)",
+      [filename, uploadResult.secure_url, size]
     );
 
-    // Pipe file buffer to Cloudinary
-    result.end(req.file.buffer);
+    res.json({ url: uploadResult.secure_url, filename });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'Upload failed' });
+    console.error("Upload failed:", e);
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
-// List all recordings
-app.get('/api/recordings', async (req, res) => {
+// List recordings
+app.get("/api/recordings", async (req, res) => {
   try {
     const result = await pool.query(
-      'SELECT id, filename, url, filesize, createdAt FROM recordings ORDER BY id DESC'
+      "SELECT id, filename, url, filesize, createdAt FROM recordings ORDER BY id DESC"
     );
     res.json(result.rows);
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: 'DB query failed' });
+    console.error("DB query failed:", e);
+    res.status(500).json({ error: "DB query failed" });
   }
 });
 
